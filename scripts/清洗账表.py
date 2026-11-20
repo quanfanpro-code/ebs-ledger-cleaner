@@ -11,13 +11,13 @@ from zipfile import BadZipFile
 
 try:
     from openpyxl import load_workbook
-    from openpyxl.utils.cell import column_index_from_string
+    from openpyxl.utils.cell import column_index_from_string, get_column_letter
     from openpyxl.utils.exceptions import InvalidFileException
     import xlsxwriter
 except ImportError as exc:
     raise SystemExit('缺少 Excel 读写组件。请由 Agent 按技能中的安装说明补齐后再运行。') from exc
 
-from 读取账表 import 输入错误, 字段, 规范, 文本, 有值, 读表, 金额, 位置
+from 读取账表 import 输入错误, 字段, 规范, 文本, 有值, 读表, 查看结构, 金额, 位置
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +45,9 @@ def 准备参数():
     p.add_argument('--科目规则', type=Path, help='用户确认后的额外科目规则文件')
     p.add_argument('--表头别名', type=Path, help='用户确认的表头别名文件')
     p.add_argument('--指定列', type=Path, help='用户确认的列位置文件，用于解决重名列')
+    p.add_argument('--查看结构', action='store_true', help='只查看工作表、合并区域、列位置和样例行')
+    p.add_argument('--样例行数', type=int, default=18, help='查看结构时读取前多少行')
+    p.add_argument('--版式方案', type=Path, help='Agent 根据原表证据整理的版式与字段位置')
     p.add_argument('--表头扫描行数', type=int, default=120)
     p.add_argument('--金额小数位', type=int, choices=range(0,7), default=2)
     return p.parse_args()
@@ -121,6 +124,42 @@ def 载入指定列(file):
             if col > 16384:
                 raise 输入错误(f'{kind}「{key}」的指定列超出 Excel 范围。')
             result[kind][key] = col-1
+    return result
+
+
+def 载入版式(file, input_names):
+    if not file:
+        return {}
+    data = json.loads(file.read_text(encoding='utf-8-sig'))
+    if not isinstance(data,dict) or not data or len(input_names) != len(set(input_names)) or not data.keys() <= set(input_names):
+        raise 输入错误('版式方案需以本次输入中互不重名的文件名为索引。')
+    required = {'类型','工作表','表头末行','列'}
+    allowed = required | {'公司标识','会计期间'}
+    result = {}
+    for name,entry in data.items():
+        if not isinstance(entry,dict) or not required <= entry.keys() <= allowed:
+            raise 输入错误(f'{name} 的版式方案应包含类型、工作表、表头末行和列。')
+        kind,title,end,fields = (entry[key] for key in ('类型','工作表','表头末行','列'))
+        if not isinstance(kind,str) or kind not in 表名 or not isinstance(title,str) or not title.strip():
+            raise 输入错误(f'{name} 的版式方案需要有效的类型和工作表名称。')
+        if type(end) is not int or not 1 <= end <= 10000 or not isinstance(fields,dict) or not fields.keys() <= 字段.keys():
+            raise 输入错误(f'{name} 的版式方案表头行号或字段不合法。')
+        columns = {}
+        for key,value in fields.items():
+            if not isinstance(value,str) or not re.fullmatch('[A-Za-z]{1,3}',value.strip()):
+                raise 输入错误(f'{name} 的「{key}」需要填写 Excel 列字母。')
+            col = column_index_from_string(value.strip())
+            if col > 16384 or col-1 in columns.values():
+                raise 输入错误(f'{name} 的「{key}」指定列超出范围或重复。')
+            columns[key] = col-1
+        if '公司标识' in entry and (not isinstance(entry['公司标识'],str) or not 有值(entry['公司标识'])):
+            raise 输入错误(f'{name} 的公司标识需要填写来自原表的实际标识。')
+        if '会计期间' in entry:
+            period = entry['会计期间']
+            if (kind != '余额表' or not isinstance(period,str) or
+                not re.fullmatch(r'\d{4}-(?:0[1-9]|1[0-2])~\d{4}-(?:0[1-9]|1[0-2])',period) or period[:7] > period[8:]):
+                raise 输入错误(f'{name} 的余额表期间需要填写起止月份，例如 2025-01~2025-12。')
+        result[name] = {**entry,'列':columns}
     return result
 
 
@@ -214,21 +253,26 @@ def 项目名称(row, segment, catalog):
     direct = row.名称.get(segment)
     candidates = catalog.get((row.编码[0],segment,token), set())
     distinct = {规范(v) for v in candidates}
-    if not 有值(token) or (segment == 7 and (token == '9999' or direct == '重分类-项目段')):
+    if segment == 7 and (token == '9999' or direct == '重分类-项目段'):
         return '', ''
+    if not 有值(token):
+        return ('',direct) if row.分列 and 有值(direct) else ('','')
     if len(distinct) > 1:
         return '', ''
-    if 有值(direct):
-        return token,direct
     if len(distinct) == 1:
         return token,min(candidates)
+    if 有值(direct):
+        return token,direct
     return '', ''
 
 
 def 贷款银行(row, catalog):
+    code,name = row.贷款行
+    if 有值(name):
+        return (code if 有值(code) else ''),name
     token, lender = 项目名称(row,8,catalog)
     if token and token != row.编码[0] and (
-        有值(row.编码[8]) or any(term in lender for term in ('银行','信用社','信用合作','财务有限','财务公司'))
+        (not row.分列 and 有值(row.编码[8])) or any(term in lender for term in ('银行','信用社','信用合作','财务有限','财务公司'))
     ):
         return token,lender
     return '', ''
@@ -241,8 +285,9 @@ def 辅助规则(books, rules, catalog):
             if rules[row.编码[3]][1] != 'loan':
                 continue
             bank = 贷款银行(row,catalog)
-            if bank[0] and 有值(row.编码[6]):
-                loans[(row.编码[0],row.编码[6])].add(bank)
+            contract = row.合同 if row.分列 else row.编码[6]
+            if bank[1] and 有值(contract):
+                loans[(row.编码[0],contract)].add(bank)
 
     def choose(row):
         rule = rules[row.编码[3]]
@@ -252,16 +297,32 @@ def 辅助规则(books, rules, catalog):
         if source == 'year':
             return (row.年份,row.年份,'') if row.年份 else ('','会计年度未记录','会计期间无法确认')
         if source == 'loan':
+            if not 有值(row.贷款行[1]) and row.往来冲突:
+                raise 输入错误(row.往来冲突)
             token, name = 贷款银行(row,catalog)
         elif source == 'interest':
-            candidates = loans.get((row.编码[0],row.编码[6]), set())
-            if len(candidates) != 1:
+            contract = row.合同 if row.分列 else row.编码[6]
+            candidates = loans.get((row.编码[0],contract), set())
+            candidates = set(candidates)
+            if 有值(row.贷款行[1]):
+                candidates.add(贷款银行(row,catalog))
+            names = {规范(name) for _,name in candidates}
+            codes = {code for code,_ in candidates if 有值(code)}
+            if len(names) > 1 or len(codes) > 1:
+                if 有值(row.贷款行[1]):
+                    raise 输入错误(f'{row.位置} 的利息贷款银行与同公司同合同的本金资料冲突。请核对贷款银行和合同编码。')
+            if len(names) != 1 or len(codes) > 1:
                 return '', '贷款银行待核', '同公司同合同未唯一匹配贷款银行'
-            token,name = next(iter(candidates))
+            token = next(iter(codes),'')
+            name = min(name for _,name in candidates)
         else:
+            if source == 8 and row.往来冲突:
+                raise 输入错误(row.往来冲突)
             token,name = 项目名称(row,source,catalog)
         if token:
             return token,name,''
+        if name:
+            return '',name,f'{dimension}只有名称，按原行保留'
         if source == 7 and (row.编码[6] == '9999' or row.名称.get(7) == '重分类-项目段'):
             return '', '重分类调整', '重分类项目占位单独留痕'
         label = '往来' if source == 8 else ('项目' if source == 7 else dimension)
@@ -277,9 +338,29 @@ def 向量合计(rows, size):
     return tuple(amounts)
 
 
+def 银行跨表对应(journal_aux, balance_aux, journal_accounts, balance_accounts):
+    links = []
+    for identity in sorted(journal_accounts.keys() & balance_accounts.keys()):
+        left, right = journal_accounts[identity], balance_accounts[identity]
+        if len(left) != 1 or len(right) != 1:
+            continue
+        j_key,j_numbers = next(iter(left.items()))
+        b_key,b_numbers = next(iter(right.items()))
+        numbers = j_numbers | b_numbers
+        if len(numbers) != 1 or j_key == b_key:
+            continue
+        # 至少一边有独立账号列，另一边的完整开户行及账号与其一致。
+        target, previous, moving = (j_key,b_key,balance_aux) if j_numbers else (b_key,j_key,journal_aux)
+        if target in moving:
+            continue
+        moving[target] = moving.pop(previous)
+        links.append((*identity[:2],j_key[2],b_key[2],next(iter(numbers)),target[3]))
+    return links
+
+
 def 准备输出(books, rules, names, choose):
     results, traces, checks, warnings = {}, {}, [], []
-    movements = {}
+    movements, bank_accounts = {}, {}
     for book in books:
         kind = book.类别
         data = []
@@ -288,6 +369,7 @@ def 准备输出(books, rules, names, choose):
         group_keys = {}
         by_subject = defaultdict(lambda:[0,0])
         by_aux = defaultdict(lambda:[0,0])
+        banks = defaultdict(lambda:defaultdict(set))
         vouchers = defaultdict(int)
         for position, row in enumerate(book.行):
             company, code = row.编码[0], row.编码[3]
@@ -295,9 +377,15 @@ def 准备输出(books, rules, names, choose):
             if issue:
                 warnings.append((kind,str(row.位置),code,issue))
             movement = row.金额 if kind == '序时账' else row.金额[1:3]
-            for key, destination in [((company,code),by_subject),((company,code,aux,aux_name),by_aux)]:
+            aux_key = (company,code,aux,aux_name)
+            for key, destination in [((company,code),by_subject),(aux_key,by_aux)]:
                 for i,value in enumerate(movement):
                     destination[key][i] += value
+            if rules[code][1] == 5 and aux and aux_name:
+                label, number = 规范(aux_name),规范(row.银行账号)
+                observed = banks[(company,code,label)][aux_key]
+                if number and aux == row.银行账号 and label.endswith(number) and len(label) > len(number):
+                    observed.add(row.银行账号)
             if kind == '序时账':
                 vouchers[(company,row.期间,row.凭证)] += movement[0] - movement[1]
                 data.append((row.日期,row.类型 or None,row.凭证,row.摘要 or None,code,names[code],*row.金额,aux or None,aux_name))
@@ -312,7 +400,7 @@ def 准备输出(books, rules, names, choose):
                 output_row = group_keys[key][0]
                 if row.金额[0]+row.金额[1]-row.金额[2] != row.金额[3]:
                     warnings.append((kind,str(row.位置),code,'原表期初加借减贷不等于期末，原金额已保留'))
-            trace.append((book.文件,book.页,row.位置.行,row.行号 or None,company,code,'.'.join(row.编码),rules[code][0],
+            trace.append((book.文件,book.页,row.位置.行,row.行号 or None,company,code,row.原始组合 or None,rules[code][0],
                           aux or None,aux_name,output_row))
         if kind == '余额表':
             for key,(o,d,c,e) in amounts.items():
@@ -324,6 +412,7 @@ def 准备输出(books, rules, names, choose):
                 warnings.append((kind,book.文件,'',f'{bad_vouchers} 个凭证分组借贷发生额不同，原分录已保留'))
         results[kind], traces[kind] = data, trace
         movements[kind] = (by_subject,by_aux)
+        bank_accounts[kind] = banks
         size = len(原金额[kind])
         source_total = 向量合计((r.金额 for r in book.行),size)
         output_total = 向量合计((tuple(r[i] for i in 金额列[kind]) for r in data),size)
@@ -335,7 +424,7 @@ def 准备输出(books, rules, names, choose):
             if amount != source_total:
                 warnings.append((kind,str(pos),'','源表合计行和明细合计不同，建议检查源表范围'))
         warnings.extend((kind,str(pos),'',f'{reason}：{text}') for pos,reason,text in book.警示)
-    differences, auxiliary = [], []
+    differences, auxiliary, bank_links = [], [], []
     cross_status = '单表运行'
     if len(books) == 2:
         journal = next(b for b in books if b.类别 == '序时账')
@@ -345,6 +434,8 @@ def 准备输出(books, rules, names, choose):
         cross_status = '公司、会计期间可对应' if same_company and same_period else '公司或会计期间未确认一致，跨表差异供参考'
         for index,destination in [(0,differences),(1,auxiliary)]:
             j,b = movements['序时账'][index],movements['余额表'][index]
+            if index == 1 and same_company and same_period:
+                bank_links = 银行跨表对应(j,b,bank_accounts['序时账'],bank_accounts['余额表'])
             for key in sorted(j.keys()|b.keys()):
                 jd,jc = j.get(key,(0,0))
                 bd,bc = b.get(key,(0,0))
@@ -356,7 +447,7 @@ def 准备输出(books, rules, names, choose):
             j = sum(v[i] for v in movements['序时账'][0].values())
             b = sum(v[i] for v in movements['余额表'][0].values())
             checks.append(('跨表',field,j,b,j-b,cross_status))
-    return results,traces,checks,warnings,differences,auxiliary,cross_status
+    return results,traces,checks,warnings,differences,auxiliary,bank_links,cross_status
 
 
 def _write_book(path, sheets, precision):
@@ -418,7 +509,7 @@ def _verify_output(path, kind, expected, precision):
 
 
 def 写结果(args, books, rules, names, prepared):
-    results,traces,checks,warnings,differences,auxiliary,cross_status = prepared
+    results,traces,checks,warnings,differences,auxiliary,bank_links,_ = prepared
     output_dir = (args.输出目录 or Path.cwd()).resolve()
     output_dir.mkdir(parents=True,exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix='.处理中-',dir=output_dir))
@@ -430,10 +521,13 @@ def 写结果(args, books, rules, names, prepared):
             _write_book(stage/表名[kind],[(kind,表头[kind],data,金额列[kind],widths)],precision)
             _verify_output(stage/表名[kind],kind,data,precision)
         overview = [(b.类别,b.文件,b.页,b.表头,b.期间 or '未识别',len(b.行),len(results[b.类别])) for b in books]
-        trace_columns = ['源文件','源工作表','源表行号','原分录行号','公司编码','科目编码','原账户组合','选定维度','辅助核算编码','辅助核算名称','结果表行号']
+        trace_columns = ['源文件','源工作表','源表行号','原分录行号','公司标识','科目编码','原账户组合','选定维度','辅助核算编码','辅助核算名称','结果表行号']
         diff_cols = ['序时账借方','序时账贷方','余额表借方','余额表贷方','借方差额','贷方差额']
         sheets = [
             ('读表结果',['表种类','源文件','工作表','识别的表头末行','会计期间','源表明细行数','输出明细行数'],overview,(),[14,36,24,19,22,17,17]),
+            ('字段定位',['表种类','源文件','工作表','字段','原表列','识别方式'],
+             [(b.类别,b.文件,b.页,key,get_column_letter(col+1),b.识别方式)
+              for b in books for key,col in sorted(b.字段.items(),key=lambda item:item[1])],(),[14,36,24,19,12,22]),
             ('金额核对',['范围','项目','原表或序时账','结果或余额表','差额','说明'],checks,(2,3,4),[13,21,22,22,18,49]),
             ('待核记录',['表种类','位置','科目编码','原因'],warnings,(),[14,51,18,60]),
             ('科目规则',['科目编码','科目名称','选定维度','规则依据'],
@@ -444,6 +538,9 @@ def 写结果(args, books, rules, names, prepared):
                 ('跨表科目差异',['公司编码','科目编码','科目名称',*diff_cols],differences,range(3,9),[16,16,44,*([19]*6)]),
                 ('跨表辅助差异',['公司编码','科目编码','科目名称','辅助核算编码','辅助核算名称',*diff_cols],auxiliary,range(5,11),[16,16,42,19,35,*([19]*6)]),
             ])
+        if bank_links:
+            sheets.append(('跨表银行对应',['公司标识','科目编码','序时账辅助编码','余额表辅助编码','实际银行账号','开户行及账号'],
+                           bank_links,(),[16,17,23,23,26,48]))
         for kind,trace in traces.items():
             sheets.append((kind+'来源',trace_columns,trace,(),[34,25,15,15,16,16,48,26,20,38,17]))
         report = stage/'清洗核对.xlsx'
@@ -471,7 +568,7 @@ def main():
         ('序时账',args.序时账,args.序时账工作表),('余额表',args.余额表,args.余额表工作表)
     ) if path]
     if not inp:
-        paths, directory = 选择文件(not args.预检 and not args.输出目录)
+        paths, directory = 选择文件(not args.预检 and not args.查看结构 and not args.输出目录)
         args.输出目录 = args.输出目录 or directory
         inp = [('',path,None) for path in paths]
     if not 1 <= len(inp) <= 2:
@@ -480,15 +577,21 @@ def main():
         raise 输入错误('指定单个工作表时，只能提供一份文件。两份文件请分别指定其类型和工作表。')
     if args.表头扫描行数 < 4:
         raise 输入错误('表头扫描行数应至少为4。')
-    overrides = 载入别名(args.表头别名)
-    assigned = 载入指定列(args.指定列)
-    books = []
+    if not 1 <= args.样例行数 <= 200:
+        raise 输入错误('样例行数应在1至200之间。')
     if len({file.resolve() for _,file,_ in inp}) != len(inp):
         raise 输入错误('同一文件重复提交。')
-    for kind,file,sheet in inp:
+    for _,file,_ in inp:
         if file.suffix.casefold() not in ('.xlsx','.xlsm') or not file.is_file():
             raise 输入错误(f'需要可读的 Excel 工作簿：{file.name}。')
-        books.append(读表(file,kind,sheet or args.工作表,args.表头扫描行数,overrides,assigned,args.金额小数位))
+    if args.查看结构:
+        print(json.dumps([查看结构(file,args.样例行数) for _,file,_ in inp],ensure_ascii=False,default=str))
+        return
+    overrides = 载入别名(args.表头别名)
+    assigned = 载入指定列(args.指定列)
+    layouts = 载入版式(args.版式方案,[file.name for _,file,_ in inp])
+    books = [读表(file,kind,sheet or args.工作表,args.表头扫描行数,overrides,assigned,args.金额小数位,layouts.get(file.name))
+             for kind,file,sheet in inp]
     if len({b.类别 for b in books}) != len(books):
         raise 输入错误('输入的两份文件识别为同一类。请确认要处理哪份，或补充另一类账表。')
     exact,user_rules = 载入规则(args.科目规则)

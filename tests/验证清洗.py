@@ -143,6 +143,120 @@ class 清洗行为(unittest.TestCase):
         book.save(self.balance)
         self.assertIn('换算',self.run_skill(success=False,files=[self.balance]))
 
+    def test_自动识别分列序时账并按科目取维度(self):
+        book = Workbook()
+        sheet = book.active
+        sheet.append(('凭证日期','凭证编号','科目编号','科目名称','本位币借方金额','本位币贷方金额',
+                      '开户行','银行账号','客户名称','客户编码','供应商名称','供应商编码','账套编码',
+                      '合同编号','贷款银行','贷款银行编码'))
+        sheet.append(('2025/01/02','000017','1002010101','银行存款-人民币',100,0,
+                      '示例银行城东支行',1234,'某客户','K01','某供应商','S01','001'))
+        sheet['H2'].number_format = '00000000'
+        sheet.append(('2025/01/02','000017','2202010301','应付账款-经营性-应付工程款-开票款',0,100,
+                      None,None,'某客户','K01','某供应商','S01','001'))
+        sheet.append(('2025/01/02','000018','2231020101','应付利息-长期借款利息-正常利息',0,20,
+                      None,None,None,None,None,None,'001','C01','示例银行城东支行','B01'))
+        book.save(self.journal)
+        result = self.run_skill(files=[self.journal])
+        rows = self.load_rows(result/'序时账-借贷两列.xlsx','序时账')
+        self.assertEqual(rows[1][8:10],('00001234','示例银行城东支行 00001234'))
+        self.assertEqual(rows[2][8:10],('S01','某供应商'))
+        self.assertEqual(rows[3][8:10],('B01','示例银行城东支行'))
+        trace = self.load_rows(result/'清洗核对.xlsx','序时账来源')
+        self.assertIsNone(trace[1][6])
+
+    def test_查看结构和适配自定义余额表(self):
+        book = Workbook()
+        sheet = book.active
+        sheet.title = '区间汇总'
+        sheet['A1'] = '2025年01月至12月'
+        sheet['C1'] = '账套编码001'
+        sheet.merge_cells('A2:G2')
+        sheet['A2'] = '汇总对照'
+        sheet.append(('余额新','编号','摘要性质','增','减','余额旧','单位名','单位键'))
+        sheet.append((40,'2202010301','应付账款-经营性-应付工程款-开票款',50,10,0,'甲供应商','S01'))
+        sheet.append((60,'2202010301','应付账款-经营性-应付工程款-开票款',70,10,0,'甲供应商','S01'))
+        sheet.append((15,'2202010301','应付账款-经营性-应付工程款-开票款',15,0,0,'甲供应商',None))
+        sheet.append(('','合计','',135,20,0))
+        sheet['A7'] = 115
+        book.save(self.balance)
+        report = subprocess.run([sys.executable,str(SCRIPT),'--输入',str(self.balance),'--查看结构'],
+                                capture_output=True,encoding='utf-8',check=True)
+        structure = json.loads(report.stdout)
+        self.assertIn('A2:G2', structure[0]['工作表'][0]['合并区域'])
+        self.assertEqual(structure[0]['工作表'][0]['样例行'][2]['单元格']['B'],'编号')
+        plan = self.work/'本次版式.json'
+        plan.write_text(json.dumps({self.balance.name: {'类型':'余额表','工作表':'区间汇总','表头末行':3,
+            '公司标识':'001','列':{'期末':'A','科目编码':'B','科目名称':'C','借方':'D','贷方':'E','期初':'F',
+                              '供应商':'G','供应商编码':'H'}}},ensure_ascii=False),encoding='utf-8')
+        result = self.run_skill(files=[self.balance],optional=('--版式方案',str(plan)))
+        rows = self.load_rows(result/'余额表-借贷两列.xlsx','余额表')
+        self.assertEqual(len(rows),3)
+        self.assertEqual(rows[1][2:4],('S01','甲供应商'))
+        self.assertEqual(rows[1][7:10],(120,20,100))
+        self.assertEqual(rows[2][2:4],(None,'甲供应商'))
+        audit = self.load_rows(result/'清洗核对.xlsx','字段定位')
+        self.assertIn(('余额表',self.balance.name,'区间汇总','科目编码','B','版式方案'),audit)
+        trace = self.load_rows(result/'清洗核对.xlsx','余额表来源')
+        self.assertEqual([r[2] for r in trace[1:]],[4,5,6])
+
+    def test_无法确定公司范围时先确认(self):
+        book = Workbook()
+        sheet = book.active
+        sheet.append(('科目编码','科目名称','借方','贷方','期初余额','期末余额'))
+        sheet.append(('1001010101','库存现金-人民币',1,0,0,1))
+        book.save(self.balance)
+        self.assertIn('公司范围',self.run_skill(success=False,files=[self.balance]))
+
+    def test_账户组合与分列可混用且保留来源(self):
+        book = Workbook()
+        sheet = book.active
+        sheet['A1'] = '账套编码：001'
+        sheet['A2'] = '2025年01月至01月'
+        sheet.append(('科目编码','科目名称','借方','贷方','期初余额','期末余额','银行账号','开户行'))
+        sheet.append(('1002010101','银行存款-人民币',-10,0,100,90,'00001234','示例银行城东支行'))
+        book.save(self.balance)
+        result = self.run_skill()
+        journal_rows = self.load_rows(result/'清洗核对.xlsx','序时账来源')
+        balance_rows = self.load_rows(result/'清洗核对.xlsx','余额表来源')
+        self.assertEqual(journal_rows[3][4:7],('001','1002010101','001.0.0.1002010101.00005.0.0.001.B01.0'))
+        self.assertEqual(balance_rows[1][4:7],('001','1002010101',None))
+        checks = self.load_rows(result/'清洗核对.xlsx','金额核对')
+        self.assertEqual(checks[-1][5],'公司、会计期间可对应')
+        auxiliary_diffs = self.load_rows(result/'清洗核对.xlsx','跨表辅助差异')
+        self.assertFalse(any(r[1] == '1002010101' for r in auxiliary_diffs[1:]))
+        bank_matches = self.load_rows(result/'清洗核对.xlsx','跨表银行对应')
+        self.assertEqual(bank_matches[1][:4],('001','1002010101','00005','00001234'))
+
+    def test_分列表的同一项目不能代替借款合同(self):
+        book = Workbook()
+        sheet = book.active
+        sheet.append(('日期','凭证号','科目编码','科目名称','借方','贷方','公司编码','项目编码','贷款银行','贷款银行编码'))
+        sheet.append(('2025/01/02','001','2501010107','长期借款-人民币-本金-质押加抵押加保证借款',
+                      100,0,'001','开发01','示例银行城东支行','B01'))
+        sheet.append(('2025/01/02','001','2231020101','应付利息-长期借款利息-正常利息',0,100,'001','开发01'))
+        book.save(self.journal)
+        result = self.run_skill(files=[self.journal])
+        rows = self.load_rows(result/'序时账-借贷两列.xlsx','序时账')
+        self.assertEqual(rows[1][8:10],('B01','示例银行城东支行'))
+        self.assertEqual(rows[2][8:10],(None,'贷款银行待核'))
+
+    def test_不接受与原表冲突的版式方案(self):
+        book = Workbook()
+        sheet = book.active
+        sheet.append(('科目编号','科目名称','借方','贷方','期初','期末','公司编码'))
+        sheet.append(('1001010101','库存现金-人民币',10,0,0,10,'001'))
+        sheet.append(('1001010101','库存现金-人民币',12,0,0,12,'001'))
+        book.save(self.balance)
+        columns = {'科目编码':'A','科目名称':'B','借方':'C','贷方':'D','期初':'E','期末':'F','公司编码':'G'}
+        plan = self.work/'错列.json'
+        for end,mapping,reason in ((1,{**columns,'借方':'D','贷方':'C'},'冲突'),(2,columns,'金额数据')):
+            with self.subTest(reason=reason):
+                plan.write_text(json.dumps({self.balance.name:{'类型':'余额表','工作表':'Sheet',
+                    '表头末行':end,'列':mapping}},ensure_ascii=False),encoding='utf-8')
+                response = self.run_skill(success=False,files=[self.balance],optional=('--版式方案',str(plan)))
+                self.assertIn(reason,response)
+
 
 if __name__ == '__main__':
     unittest.main()
